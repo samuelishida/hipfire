@@ -1163,8 +1163,11 @@ async fn handle_streaming(
     let body_cancelled = Arc::clone(&cancelled);
     tokio::task::spawn_blocking(move || {
         // Dropped on every exit path, including an unwind, so a finished or
-        // panicked request can never keep the response body open.
-        let _heartbeat = heartbeat_guard;
+        // panicked request can never keep the response body open. Taken and
+        // dropped inside the terminal callback BEFORE the terminal ack is
+        // delivered, so no `: keepalive` comment can follow the acked
+        // `[DONE]` frame (finish_sse_stream's no-post-commit-bytes contract).
+        let mut heartbeat = Some(heartbeat_guard);
         let result = complete_request_cancellable(
             &shared_clone,
             &body,
@@ -1172,8 +1175,14 @@ async fn handle_streaming(
             Some((id_clone.clone(), created)),
             &cancelled,
             |event| forward_sse_stream_event(&tx_clone, &id_clone, created, &model_clone, event),
-            |completion| deliver_sse_terminal_ack(&tx_clone, completion, include_usage),
+            |completion| {
+                if let Some(hb) = heartbeat.take() {
+                    drop(hb);
+                }
+                deliver_sse_terminal_ack(&tx_clone, completion, include_usage)
+            },
         );
+        drop(heartbeat); // unwind or early-exit safety: aborted heartbeat closes the body
         finish_sse_stream(tx_clone, result);
     });
 
